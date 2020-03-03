@@ -27,6 +27,9 @@ import copy
 import json
 import warnings
 from .symbol import Symbol
+import math
+import operator
+from functools import reduce
 
 def _str2tuple(string):
     """Convert shape string to list, internal use only.
@@ -42,6 +45,32 @@ def _str2tuple(string):
         Represents shape.
     """
     return re.findall(r"\d+", string)
+
+def _str2ints(string):
+    return map(int, _str2tuple(string))
+
+def get_flops(feature_map_size, conv_filter, stride=1, padding=1):
+    n = conv_filter[1] * conv_filter[2] * conv_filter[3]  # vector_length
+    flops_per_instance = n
+
+    num_instances_per_filter = ((feature_map_size - conv_filter[2] + 2 * padding) // stride) + 1  # for rows
+    num_instances_per_filter *= ((feature_map_size - conv_filter[2] + 2 * padding) // stride) + 1  # multiplying with cols
+
+    flops_per_filter = num_instances_per_filter * flops_per_instance
+    total_flops_per_layer = flops_per_filter * conv_filter[0]  # multiply with number of filters
+    return total_flops_per_layer
+
+def convert_size(size_bytes, base=1024):
+    if size_bytes == 0:
+        return "0B"
+    if base == 1024:
+        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+    elif base == 1000:
+        size_name = ("", "thousand", "million", "billion", "trillion", "Peta", "Eta", "Zeta", "Y")
+    i = int(math.floor(math.log(size_bytes, base)))
+    p = math.pow(base, i)
+    s = round(size_bytes / p, 2)
+    return "%s %s" % (s, size_name[i])
 
 def print_summary(symbol, shape=None, line_length=120, positions=[.44, .64, .74, 1.]):
     """Convert symbol for detail information.
@@ -89,7 +118,7 @@ def print_summary(symbol, shape=None, line_length=120, positions=[.44, .64, .74,
     if positions[-1] <= 1:
         positions = [int(line_length * p) for p in positions]
     # header names for the different log elements
-    to_display = ['Layer (type)', 'Output Shape', 'Param #', 'Previous Layer']
+    to_display = ['Layer (type)', 'Output Shape', 'Param #', 'FLOPS #', 'Prec.', 'Previous Layer']
     def print_row(fields, positions):
         """Print format row.
 
@@ -206,6 +235,200 @@ def print_summary(symbol, shape=None, line_length=120, positions=[.44, .64, .74,
             print('_' * line_length)
     print("Total params: {params}".format(params=total_params))
     print('_' * line_length)
+
+
+def print_summary_ops(symbol, shape=None, line_length=120, positions=[.40, .52, .60, .68, .73, 1.], quantized_bitwidth=32):
+    """Convert symbol for detail information.
+
+    Parameters
+    ----------
+    symbol: Symbol
+        Symbol to be visualized.
+    shape: dict
+        A dict of shapes, str->shape (tuple), given input shapes.
+    line_length: int
+        Rotal length of printed lines
+    positions: list
+        Relative or absolute positions of log elements in each line.
+
+    Returns
+    ------
+    None
+
+    Notes
+    -----
+    If ``mxnet`` is imported, the visualization module can be used in its short-form.
+    For example, if we ``import mxnet`` as follows::
+
+        import mxnet
+
+    this method in visualization module can be used in its short-form as::
+
+        mxnet.viz.print_summary(...)
+
+    """
+    if not isinstance(symbol, Symbol):
+        raise TypeError("symbol must be Symbol")
+    show_shape = False
+    if shape is not None:
+        show_shape = True
+        interals = symbol.get_internals()
+        _, out_shapes, _ = interals.infer_shape(**shape)
+        if out_shapes is None:
+            raise ValueError("Input shape is incomplete")
+        shape_dict = dict(zip(interals.list_outputs(), out_shapes))
+    conf = json.loads(symbol.tojson())
+    nodes = conf["nodes"]
+    heads = set(conf["heads"][0])
+    if positions[-1] <= 1:
+        positions = [int(line_length * p) for p in positions]
+    # header names for the different log elements
+    to_display = ['Layer (type)', 'Output Shape', 'Param #', 'FLOPS #', 'Prec.', 'Previous Layer']
+    def print_row(fields, positions):
+        """Print format row.
+
+        Parameters
+        ----------
+        fields: list
+            Information field.
+        positions: list
+            Field length ratio.
+        Returns
+        ------
+        None
+        """
+        line = ''
+        for i, field in enumerate(fields):
+            line += str(field)
+            line = line[:positions[i]]
+            line += ' ' * (positions[i] - len(line))
+        print(line)
+    print('_' * line_length)
+    print_row(to_display, positions)
+    print('=' * line_length)
+    def print_layer_summary(node, out_shape):
+        """print layer information
+
+        Parameters
+        ----------
+        node: dict
+            Node information.
+        out_shape: dict
+            Node shape information.
+        Returns
+        ------
+            Node total parameters.
+        """
+        op = node["op"]
+        pre_node = []
+        pre_filter = 0
+        pre_feature_map = 0
+        if op != "null":
+            inputs = node["inputs"]
+            for item in inputs:
+                input_node = nodes[item[0]]
+                input_name = input_node["name"]
+                if input_node["op"] != "null" or item[0] in heads:
+                    # add precede
+                    pre_node.append(input_name)
+                    if show_shape:
+                        if input_node["op"] != "null":
+                            key = input_name + "_output"
+                        else:
+                            key = input_name
+                        if key in shape_dict:
+                            shape = shape_dict[key][1:]
+                            if not shape or op == 'Convolution' and pre_filter > 0:
+                                continue
+                            pre_filter += int(shape[0])
+                            if op == 'Convolution':
+                                pre_feature_map = int(shape[1])
+        is_quantized = "qconv" in node["name"] or "qdense" in node["name"] or "scaledbinaryconv" in node["name"]
+        cur_param = 0
+        flops = 0
+        if op == 'Convolution':
+            num_group = int(node['attrs'].get('num_group', '1'))
+            num_filter = int(node["attrs"]["num_filter"])
+            cur_param = pre_filter * num_filter // num_group
+            kernel_size = reduce(operator.mul, _str2ints(node["attrs"]["kernel"]))
+            cur_param *= kernel_size
+
+            conv_filter = (pre_filter, num_filter) + tuple(_str2ints(node["attrs"]["kernel"]))
+            stride = tuple(_str2ints(node["attrs"].get("stride", "1")))[0]
+            pad = tuple(_str2ints(node["attrs"].get("pad", "1")))[0]
+            flops = get_flops(pre_feature_map, conv_filter, stride=stride, padding=pad) // num_group
+            if node["attrs"].get("no_bias", 'False') != 'True':
+                cur_param += num_filter
+        elif op == 'FullyConnected':
+            if node["attrs"].get("no_bias", 'False') == 'True':
+                cur_param = pre_filter * int(node["attrs"]["num_hidden"])
+            else:
+                cur_param = (pre_filter+1) * int(node["attrs"]["num_hidden"])
+            # FC layers are not counted in related work
+            # flops = (pre_filter+1) * int(node["attrs"]["num_hidden"])
+        elif op == 'BatchNorm':
+            key = node["name"] + "_output"
+            if show_shape:
+                num_filter = shape_dict[key][1]
+                cur_param = int(num_filter) * 2
+        elif op == 'Embedding':
+            cur_param = int(node["attrs"]['input_dim']) * int(node["attrs"]['output_dim'])
+        if not pre_node:
+            first_connection = ''
+        else:
+            first_connection = pre_node[0]
+        fields = [node['name'] + '(' + op + ')',
+                  "x".join([str(x) for x in out_shape]),
+                  cur_param,
+                  '{:.2E}'.format(flops) if flops > 0 else 0,
+                  'Q/B' if is_quantized else 'FP',
+                  first_connection]
+        print_row(fields, positions)
+        if len(pre_node) > 1:
+            for i in range(1, len(pre_node)):
+                fields = [''] * (len(fields) - 1) + [pre_node[i]]
+                print_row(fields, positions)
+        return cur_param, is_quantized, flops
+    total_flops = 0
+    quantized_flops = 0
+    total_params = 0
+    quantized_params = 0
+    compressed_bytes = 0
+    for i, node in enumerate(nodes):
+        out_shape = []
+        op = node["op"]
+        if op == "null" and i > 0:
+            continue
+        if op != "null" or i in heads:
+            if show_shape:
+                if op != "null":
+                    key = node["name"] + "_output"
+                else:
+                    key = node["name"]
+                if key in shape_dict:
+                    out_shape = shape_dict[key][1:]
+        params, is_quantized, flops = print_layer_summary(nodes[i], out_shape)
+        total_params += params
+        total_flops += flops
+        if is_quantized:
+            quantized_params += params
+            quantized_flops += flops
+        compressed_bytes += params * (quantized_bitwidth if is_quantized else 32) / 8
+        if i == len(nodes) - 1:
+            print('=' * line_length)
+        else:
+            print('_' * line_length)
+    print('Total params:     %s' % total_params)
+    print('FP params:        %s (%.2f%%)' % (total_params - quantized_params, 100 * (total_params - quantized_params) / total_params))
+    print('Quantized params: %s (%.2f%%)' % (quantized_params, 100 * quantized_params / total_params))
+    print('Model size (full-precision): ~%s' % convert_size(total_params * 4))
+    print('Model size (compressed):     ~%s' % convert_size(compressed_bytes))
+    print('FLOPS (total):               %s' % convert_size(total_flops, 1000))
+    print('FLOPS (full-precision):      %s' % convert_size(total_flops - quantized_flops, 1000))
+    print('FLOPS (binary):              %s' % convert_size(quantized_flops, 1000))
+    print('FLOPS (combined):            %s' % convert_size(quantized_flops/64 + (total_flops - quantized_flops), 1000))
+    print('_' * line_length)
+
 
 def plot_network(symbol, title="plot", save_format='pdf', shape=None, dtype=None, node_attrs={},
                  hide_weights=True):
